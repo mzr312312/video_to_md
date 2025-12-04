@@ -1,0 +1,26 @@
+# --- 安全配置 (最重要) ---
+.env
+
+# --- Python 缓存和编译文件 ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 运行环境 ---
+venv/
+.idea/
+.vscode/
+
+# --- 项目特定的忽略文件 ---
+# 忽略输入的视频文件夹 (因为视频通常很大，不适合传 Github)
+videos/
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# 忽略输出的文字稿 (这是生成的结果，没必要上传)
+transcripts/
+
+# 忽略临时生成的音频文件
+temp_audio_extract.mp3
