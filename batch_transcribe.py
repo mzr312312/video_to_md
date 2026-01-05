@@ -1,109 +1,155 @@
 import os
 import sys
-from dotenv import load_dotenv  # 引入库
+import math
+import time
+import re
+import json
+from dotenv import load_dotenv
 from groq import Groq
 from moviepy import VideoFileClip
+from pydub import AudioSegment
 
 # ================= 配置区域 =================
-# 1. 加载 .env 文件中的环境变量
 load_dotenv()
-
-# 2. 从环境变量获取 API Key (不再硬编码)
 API_KEY = os.getenv("GROQ_API_KEY")
 
-# 增加一个安全检查，防止用户忘记配置
+# 【手动指定 FFmpeg 路径】如果环境变量失效，请取消下面两行的注释并修改路径
+# AudioSegment.converter = r"C:\ffmpeg\bin\ffmpeg.exe"
+# AudioSegment.ffprobe   = r"C:\ffmpeg\bin\ffprobe.exe"
+
 if not API_KEY:
-    print("❌ 错误: 未找到 API Key。")
-    print("请确保你创建了 .env 文件，并设置了 GROQ_API_KEY=你的密钥")
+    print("❌ 错误: 未找到 API Key。请检查 .env 文件。")
     sys.exit(1)
 
-# 你的视频文件夹路径
 INPUT_FOLDER = r"./videos"
-# 转录结果保存路径
 OUTPUT_FOLDER = r"./transcripts"
-# 支持的视频格式后缀
 VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.flv')
-# 使用的模型
 MODEL_ID = "whisper-large-v3"
+
+# 切割设置：每段 15 分钟
+CHUNK_DURATION_MS = 15 * 60 * 1000
 # ===========================================
 
-# 初始化 Groq 客户端
 client = Groq(api_key=API_KEY)
 
 
-# ... (后续 extract_audio 和 transcribe_audio_file 函数代码保持不变) ...
-# ... (main 函数代码保持不变) ...
-
-# 为了完整性，这里补全 extract_audio 之后的代码结构，确保你可以直接复制
 def extract_audio(video_path, audio_path):
-    """从视频中提取音频并保存为临时 MP3 文件"""
+    """从视频中提取音频"""
     try:
-        # 使用 moviepy 提取音频
         with VideoFileClip(video_path) as video:
             if video.audio is not None:
-                # 降低比特率以减小文件体积，64k 对于语音转录足够了
                 video.audio.write_audiofile(audio_path, bitrate="64k", logger=None)
                 return True
             else:
                 print(f"⚠️ 跳过：文件 {os.path.basename(video_path)} 没有音轨")
                 return False
     except Exception as e:
-        print(f"❌ 提取音频失败: {video_path}, 错误: {e}")
+        print(f"❌ 提取音频失败: {e}")
         return False
 
 
-def transcribe_audio_file(audio_path):
-    """调用 Groq API 转录音频"""
+def transcribe_chunks_with_resume(audio_path, cache_path):
+    """带断点续传和自动重试的转录逻辑"""
+    combined_chunks = []
+
+    # 加载缓存进度
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            combined_chunks = json.load(f)
+        print(f"⏳ 检测到缓存，已跳过前 {len(combined_chunks)} 个已完成片段")
+
     try:
-        with open(audio_path, "rb") as file:
-            transcription = client.audio.transcriptions.create(
-                file=(os.path.basename(audio_path), file.read()),
-                model=MODEL_ID,
-                response_format="json",
-                language=None
-            )
-        return transcription.text
+        audio = AudioSegment.from_file(audio_path)
+        duration_ms = len(audio)
+        total_chunks = math.ceil(duration_ms / CHUNK_DURATION_MS)
+
+        for i in range(len(combined_chunks), total_chunks):
+            start = i * CHUNK_DURATION_MS
+            end = min((i + 1) * CHUNK_DURATION_MS, duration_ms)
+
+            chunk_name = f"temp_chunk_{i}.mp3"
+            audio[start:end].export(chunk_name, format="mp3", bitrate="64k")
+
+            # API 请求重试逻辑
+            while True:
+                try:
+                    print(f"   进度: {i + 1}/{total_chunks} 正在向 Groq 请求转录...")
+                    with open(chunk_name, "rb") as f:
+                        transcription = client.audio.transcriptions.create(
+                            file=(chunk_name, f.read()),
+                            model=MODEL_ID,
+                            language="zh"
+                        )
+                        combined_chunks.append(transcription.text)
+
+                    # 成功后立即更新缓存
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        json.dump(combined_chunks, f, ensure_ascii=False)
+                    break
+
+                except Exception as e:
+                    err_msg = str(e)
+                    if "429" in err_msg:
+                        # 解析等待时间
+                        wait_time = 60
+                        match = re.search(r"try again in (\d+m)?([\d\.]+)s", err_msg)
+                        if match:
+                            m = match.group(1)
+                            s = float(match.group(2))
+                            wait_time = (int(m[:-1]) * 60 if m else 0) + s + 2
+
+                        print(f"⏳ 触发额度限制，自动暂停 {wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"❌ API 致命错误: {e}")
+                        return None
+
+            if os.path.exists(chunk_name):
+                os.remove(chunk_name)
+
+        return "\n".join(combined_chunks)
+
     except Exception as e:
-        print(f"❌ API 调用失败: {e}")
+        print(f"❌ 处理音频流时出错: {e}")
         return None
 
 
 def main():
-    if not os.path.exists(OUTPUT_FOLDER):
-        os.makedirs(OUTPUT_FOLDER)
-
-    # 确保输入目录存在，如果不存在提示用户创建
+    if not os.path.exists(OUTPUT_FOLDER): os.makedirs(OUTPUT_FOLDER)
     if not os.path.exists(INPUT_FOLDER):
         os.makedirs(INPUT_FOLDER)
-        print(f"ℹ️ 已创建输入文件夹: {INPUT_FOLDER}，请放入视频文件后重试。")
+        print(f"ℹ️ 已创建输入文件夹: {INPUT_FOLDER}")
         return
 
-    for root, dirs, files in os.walk(INPUT_FOLDER):
-        for filename in files:
-            if filename.lower().endswith(VIDEO_EXTENSIONS):
-                video_path = os.path.join(root, filename)
-                base_name = os.path.splitext(filename)[0]
-                txt_output_path = os.path.join(OUTPUT_FOLDER, f"{base_name}.txt")
+    for filename in os.listdir(INPUT_FOLDER):
+        if filename.lower().endswith(VIDEO_EXTENSIONS):
+            video_path = os.path.join(INPUT_FOLDER, filename)
+            base_name = os.path.splitext(filename)[0]
+            txt_output_path = os.path.join(OUTPUT_FOLDER, f"{base_name}.txt")
+            cache_path = os.path.join(OUTPUT_FOLDER, f"{base_name}.cache.json")
 
-                if os.path.exists(txt_output_path):
-                    print(f"⏭️ 跳过已存在: {filename}")
-                    continue
+            if os.path.exists(txt_output_path):
+                print(f"⏭️ 跳过已存在结果: {filename}")
+                continue
 
-                print(f"🚀 正在处理: {filename} ...")
-                temp_audio_path = "temp_audio_extract.mp3"
+            print(f"🚀 开始处理: {filename}")
+            temp_audio = f"temp_{base_name}.mp3"
 
-                if extract_audio(video_path, temp_audio_path):
-                    print(f"   正在转录中 (使用 {MODEL_ID})...")
-                    text = transcribe_audio_file(temp_audio_path)
+            if extract_audio(video_path, temp_audio):
+                final_text = transcribe_chunks_with_resume(temp_audio, cache_path)
 
-                    if text:
-                        with open(txt_output_path, "w", encoding="utf-8") as f:
-                            f.write(text)
-                        print(f"✅ 完成！已保存至: {base_name}.txt")
+                if final_text:
+                    with open(txt_output_path, "w", encoding="utf-8") as f:
+                        f.write(final_text)
+                    print(f"✅ 全片转录完成！已保存。")
 
-                    if os.path.exists(temp_audio_path):
-                        os.remove(temp_audio_path)
-                print("-" * 30)
+                    # 完成后清理临时文件
+                    if os.path.exists(cache_path): os.remove(cache_path)
+                    if os.path.exists(temp_audio): os.remove(temp_audio)
+                else:
+                    print(f"⚠️ {filename} 处理中断，进度已保存至 .cache 文件")
+
+            print("-" * 40)
 
 
 if __name__ == "__main__":
